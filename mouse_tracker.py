@@ -50,9 +50,11 @@ class MouseTrackerApp:
         }
         self.root.configure(bg=self.colors["bg"])
 
-        # Grid 布局配置
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1) # Canvas 区域占据主要空间
+
+        # 常量定义
+        self.TARGET_RADIUS = 20 # 目标半径 (px)
 
         # 数据存储
         self.trajectory_data = [] 
@@ -99,8 +101,6 @@ class MouseTrackerApp:
         """画布大小改变时触发"""
         self.canvas_width = event.width
         self.canvas_height = event.height
-        # 如果正在测试中并且还没画东西，可能需要重绘，但通常动态调整即可。
-        # 这里的关键是后续生成的随机点不要超出新边界。
 
     def start_test(self):
         """开始一个新的测试 Session"""
@@ -109,7 +109,7 @@ class MouseTrackerApp:
         self.current_trial = 0
         
         # 绘制起始按钮 (蓝色)
-        r = 30 # 稍大一点
+        r = 30 
         center_x, center_y = self.canvas_width // 2, self.canvas_height // 2
         self.start_pos = (center_x, center_y)
         
@@ -148,7 +148,7 @@ class MouseTrackerApp:
         self.target_pos = (target_x, target_y)
         
         # 绘制目标 (红色)
-        r = 20
+        r = self.TARGET_RADIUS
         self.target_circle = self.canvas.create_oval(target_x-r, target_y-r, target_x+r, target_y+r, fill=self.colors["target"], outline="white", width=2, tags="target")
         self.canvas.tag_bind("target", "<Button-1>", self.handle_target_click)
         
@@ -192,6 +192,7 @@ class MouseTrackerApp:
             return {
                 "time": 0, "distance": 0, "speed": 0, "curvature": 1, 
                 "ideal_distance": 0, "target_x": target_pos[0], "target_y": target_pos[1],
+                "id": 0, "throughput": 0, # Fitts' Law
                 "trajectory": []
             }
 
@@ -217,12 +218,23 @@ class MouseTrackerApp:
         avg_speed = total_distance / time_elapsed if time_elapsed > 0 else 0
         curvature = total_distance / ideal_distance if ideal_distance > 0 else 1
         
+        # --- Fitts' Law Metrics ---
+        # ID = log2(D/W + 1)
+        # W (Width) 通常指目标在运动方向上的宽度。这里简化为直径 (2 * Radius)
+        width = 2 * self.TARGET_RADIUS
+        index_of_difficulty = math.log2(ideal_distance / width + 1) if width > 0 else 0
+        
+        # Throughput = ID / Time (bits/s)
+        throughput = index_of_difficulty / time_elapsed if time_elapsed > 0 else 0
+        
         return {
             "time": time_elapsed,
             "distance": total_distance,
             "ideal_distance": ideal_distance,
             "speed": avg_speed,
             "curvature": curvature,
+            "id": index_of_difficulty,
+            "throughput": throughput,
             "target_x": target_pos[0],
             "target_y": target_pos[1],
             "trajectory": list(trajectory) # 保存轨迹副本
@@ -238,6 +250,7 @@ class MouseTrackerApp:
         avg_time = sum(d["time"] for d in self.session_data) / total_trials
         avg_speed = sum(d["speed"] for d in self.session_data) / total_trials
         avg_curvature = sum(d["curvature"] for d in self.session_data) / total_trials
+        avg_throughput = sum(d["throughput"] for d in self.session_data) / total_trials
         
         # 保存数据
         saved_path = self.save_to_csv()
@@ -246,8 +259,9 @@ class MouseTrackerApp:
         result_text = (
             f"--- 测试 Session 完成 ---\n"
             f"总轮次: {total_trials}\n\n"
-            f"平均耗时: {avg_time:.3f} s\n"
-            f"平均速度: {avg_speed:.0f} px/s\n"
+            f"平均耗时 (Time): {avg_time:.3f} s\n"
+            f"平均速度 (Speed): {avg_speed:.0f} px/s\n"
+            f"平均吞吐量 (Throughput): {avg_throughput:.2f} bits/s\n"
             f"平均轨迹曲率: {avg_curvature:.2f} (理想=1.00)\n\n"
             f"数据已保存至:\n{saved_path}"
         )
@@ -266,7 +280,7 @@ class MouseTrackerApp:
         filename = f"session_{timestamp_str}.csv"
         filepath = os.path.join(data_dir, filename)
         
-        headers = ["Trial_ID", "Time_Sec", "Distance_Px", "Ideal_Distance_Px", "Speed_PxSec", "Curvature", "Target_X", "Target_Y"]
+        headers = ["Trial_ID", "Time_Sec", "Distance_Px", "Ideal_Distance_Px", "Speed_PxSec", "Curvature", "Index_of_Difficulty_Bits", "Throughput_Bits_Sec", "Target_X", "Target_Y"]
         
         try:
             with open(filepath, mode='w', newline='', encoding='utf-8') as f:
@@ -274,13 +288,6 @@ class MouseTrackerApp:
                 writer.writerow(headers)
                 
                 for i, trial in enumerate(self.session_data):
-                    # 取出轨迹最后一点作为目标位置近似值（实际目标位置在 spawn_target 中生成，但并未存储在 simple struct 中，
-                    # 严格来说应该存 target_pos。为了简单，这里我们修改一下 analyze 让他把 target_pos 也带上，或者直接用最后点击位置）
-                    # 下面我会先用 trial 数据，注意上一轮 analyze_single_trial 没存 target_pos，
-                    # 我们可以简单的假设最后一点点击位置就是目标位置（虽然有误差），或者更好的是修改 session_data 结构。
-                    # 为了更严谨，我将在下一轮修改 analyze_single_trial 增加 target_pos 字段。
-                    # 暂时先用 dummy 或 现有数据。
-                    
                     writer.writerow([
                         i + 1,
                         f"{trial['time']:.4f}",
@@ -288,6 +295,8 @@ class MouseTrackerApp:
                         f"{trial['ideal_distance']:.2f}",
                         f"{trial['speed']:.2f}",
                         f"{trial['curvature']:.4f}",
+                        f"{trial['id']:.4f}",
+                        f"{trial['throughput']:.4f}",
                         trial['target_x'],
                         trial['target_y']
                     ])
